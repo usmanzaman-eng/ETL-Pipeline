@@ -1,0 +1,155 @@
+version: "3.9"
+services:
+
+  minio:
+    image: minio/minio
+    restart: on-failure
+    command: minio server --console-address ":9001" /data
+    ports:
+      - 9000:9000
+      - 9001:9001
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    entrypoint: minio server
+    command: '/export'
+
+  createbuckets:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc config host add myminio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc rm -r --force myminio/smartthermo;
+      /usr/bin/mc mb myminio/smartthermo;
+      /usr/bin/mc policy download myminio/smartthermo;
+      exit 0;
+      "
+
+  sensorsmock:
+    build: ./sensors
+    container_name: sensor
+    ports:
+      - "3000:3000"
+    depends_on:
+      - rest-proxy
+    environment:
+      - SMART_THERMO_BUCKET=smartthermo
+      - CARBON_SENSE_URL=http://rest-proxy:8082/topics/carbonsense
+      - MOISTURE_MATE_URL=http://rest-proxy:8082/topics/moisturemate
+
+  luxdata_puller:
+    build: ./lux_data_puller
+    container_name: luxdata_puller
+    ports:
+      - "3002:3002"
+    environment:
+      - KAFKA_BOOTSTRAP_SERVER= broker:29092
+      - SENSORSMOCK_URL=http://sensorsmock:3000/api/luxmeter
+    depends_on:
+      - smart_thermo
+    restart: on-failure
+
+  smart_thermo:
+    build: ./smart_thermo_service
+    container_name: pulls3
+    ports:
+      - "3003:3003"
+    environment:
+      - SMART_THERMO_BUCKET=smartthermo
+      - KAFKA_BOOTSTRAP_SERVER= broker:29092
+    depends_on:
+      - sensorsmock
+    restart: on-failure
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.3.0
+    hostname: schema-registry
+    container_name: schema-registry
+    depends_on:
+       - broker
+    ports:
+      - "8083:8083"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'broker:29092'
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8083
+
+  rest-proxy:
+    image: confluentinc/cp-kafka-rest:7.3.0
+    depends_on:
+      - schema-registry
+    ports:
+      - 8082:8082
+    hostname: rest-proxy
+    container_name: rest-proxy
+    environment:
+      KAFKA_REST_HOST_NAME: rest-proxy
+      KAFKA_REST_BOOTSTRAP_SERVERS: 'broker:29092'
+      KAFKA_REST_LISTENERS: "http://rest-proxy:8082"
+      KAFKA_REST_SCHEMA_REGISTRY_URL: 'http://schema-registry:8083'
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  broker:
+    image: confluentinc/cp-kafka:7.3.0
+    container_name: broker
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ADVERTISED_HOST_NAME: kafka
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:29092,PLAINTEXT_HOST://127.0.0.1:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+  transformation_service:
+    build: ./transformation_service
+    environment:
+      - KAFKA_BOOTSTRAP_SERVER= broker:29092
+    depends_on:
+      - createbuckets
+    ports:
+      - "8000:8000"
+    restart: on-failure
+
+  prediction_service:
+    build: ./prediction_service
+    environment:
+      - KAFKA_BOOTSTRAP_SERVER= broker:29092
+    depends_on:
+      - luxdata_puller
+    ports:
+      - "8001:8001"
+    restart: on-failure 
+
+  databaseconnector:
+    build: ./dbconnector
+    container_name: dbconnector
+    depends_on:
+      - broker
+      - prediction_service
+    ports:
+      - "8005:8005"
+    restart: on-failure
+
+  web:
+      build: flask
+      container_name: flask
+      ports:
+        - '5000:5000'
+      depends_on:
+        - databaseconnector
+      restart: on-failure
